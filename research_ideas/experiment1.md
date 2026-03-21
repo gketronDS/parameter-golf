@@ -47,8 +47,7 @@ search to the last 6 years.
 
  Emergent Principles Across Top Scorers
 
- 1. Int6 quantization dominates — best compression/quality tradeoff; mixed int5 (MLP) + int6 (attention)
- frees space for extra layers
+ 1. Int6 quantization dominates — best compression/quality tradeoff; mixed int5 (MLP) + int6 (attention)frees space for extra layers
  2. 3x MLP expansion is standard — 1024→1536 hidden dim, consistent 0.05-0.10 BPB gain
  3. More gradient steps > more tokens — 524K batch (8,900 steps) beats 786K (7,300 steps) in fixed time
  4. SmearGate + orthogonal init + Muon/NorMuon — shared across nearly all top entries
@@ -361,12 +360,132 @@ search to the last 6 years.
 
  Phase 2: Run Top-Performer MLX Baseline
 
- RUN_ID=top_baseline ITERATIONS=200 TRAIN_BATCH_TOKENS=8192 \
-   VAL_LOSS_EVERY=0 VAL_BATCH_SIZE=8192 \
-   NUM_LAYERS=11 MLP_MULT=3 ROPE_BASE=50000 \
-   GRAD_CLIP_NORM=0.3 MATRIX_LR=0.02 MUON_MOMENTUM=0.99 \
-   python3 train_gpt_mlx.py
+ RUN_ID=top_performer_mlx ITERATIONS=200 TRAIN_BATCH_TOKENS=8192 \
+    VAL_LOSS_EVERY=200 VAL_BATCH_SIZE=8192 TRAIN_SEQ_LEN=1024 \
+    WARMUP_STEPS=20 MAX_WALLCLOCK_SECONDS=600 python3 train_gpt_mlx.py
  Record val_bpb. This is our new baseline to beat.
+
+untimeError: Item size 2 for PEP 3118 buffer format string B does not match the dtype B item size 1.  
+
+⏺ The issue is bfloat16 arrays can't be directly converted to numpy. Need to cast to float32 first in
+  the SWA accumulation.
+
+⏺ Update(train_gpt_mlx.py)
+  ⎿  Added 2 lines, removed 2 lines
+      1174          if args.swa_enabled and lr_mul < args.swa_start_frac and (step + 1) % args.s
+            wa_every == 0:
+      1175              flat_params = dict(tree_flatten(model.parameters()))
+      1176              if swa_state is None:
+      1177 -                swa_state = {k: np.array(v) for k, v in flat_params.items()}        
+      1177 +                swa_state = {k: np.array(v.astype(mx.float32)) for k, v in flat_para
+           +ms.items()}                                                                         
+      1178                  swa_count = 1
+      1179              else:
+      1180                  for k, v in flat_params.items():
+      1181 -                    swa_state[k] += np.array(v)                                     
+      1181 +                    swa_state[k] += np.array(v.astype(mx.float32))                  
+      1182                  swa_count += 1
+      1183  
+      1184          step_ms = 1000.0 * (time.perf_counter() - step_t0)
+
+⏺ Also need to fix the SWA averaging to restore original dtypes:
+
+  Read 1 file (ctrl+o to expand)
+
+⏺ The averaging also needs to restore original dtypes (e.g. tok_emb is bfloat16):
+
+⏺ Update(train_gpt_mlx.py)
+  ⎿  Added 2 lines, removed 1 line
+      1198      # ==============================================================================
+      1199      if args.swa_enabled and swa_state is not None and swa_count > 1:
+      1200          log(f"swa:averaging {swa_count} snapshots")
+      1201 -        avg = {k: mx.array(v / swa_count) for k, v in swa_state.items()}            
+      1201 +        orig_dtypes = {k: v.dtype for k, v in tree_flatten(model.parameters())}     
+      1202 +        avg = {k: mx.array(v / swa_count).astype(orig_dtypes.get(k, mx.float32)) for
+           + k, v in swa_state.items()}                                                         
+      1203          model.update(tree_unflatten(list(avg.items())))
+      1204  
+      1205      # ==============================================================================
+
+⏺ Try again with the same command.
+
+Phase 2 Results: final_int8_zlib_roundtrip val_loss:5.0346 val_bpb:2.9818 eval_time:1637320ms
+final_int8_zlib_roundtrip_exact val_loss:5.03461728 val_bpb:2.98178394
+
+Weight size: 5.2 MB
+Model size: 
+
+Phase2b: Concerned the model is not learning at the mlx scale. Need to run 3 times to get seed variance, (216, 455, 3308), then warmdown iters to allow for LR to take place that might show improvement with tc addition. 
+
+"es, honestly. 200 steps with 8192 batch = 1.6M tokens total. The top performer sees 4.7B
+   tokens. Your model (27M params) is barely past random initialization at 200 steps —
+  there's no real representation structure for TC to act on.
+
+  The sweet spot for Mac testing is enough steps that loss clearly plateaus. I'd recommend
+  1500 iterations — that's ~15 min on your Mac, and the model will actually learn:
+
+  RUN_ID=baseline_s1 SEED=1337 ITERATIONS=1500 TRAIN_BATCH_TOKENS=8192 \
+    VAL_LOSS_EVERY=500 VAL_BATCH_SIZE=8192 TRAIN_SEQ_LEN=1024 \
+    WARMUP_STEPS=20 MAX_WALLCLOCK_SECONDS=0 WARMDOWN_ITERS=450 \
+    python3 train_gpt_mlx.py
+
+  ┌────────────────┬────────────────┬──────────────────────────┬───────────────┐
+  │                │   200 steps    │        1500 steps        │ Top performer │
+  ├────────────────┼────────────────┼──────────────────────────┼───────────────┤
+  │ Total tokens   │ 1.6M           │ 12.3M                    │ 4.7B          │
+  ├────────────────┼────────────────┼──────────────────────────┼───────────────┤
+  │ Tokens/param   │ 0.06x          │ 0.45x                    │ 174x          │
+  ├────────────────┼────────────────┼──────────────────────────┼───────────────┤
+  │ Learning state │ barely started │ past initial convergence │ fully trained │
+  └────────────────┴────────────────┴──────────────────────────┴───────────────┘
+
+  200 steps is like testing a drug on someone who's already dead. 1500 gets you a living
+  patient. Still far from 8xH100, but interventions that help at 1500 steps have a much
+  better chance of transferring." At 200 steps, training loss was still ~7.0 (near random for a 1024-vocab model where
+  random = ln(1024) ≈ 6.93). The model literally hasn't learned anything yet.
+
+  At 1500 steps with 8192 batch, you'd see roughly 12.3M tokens. Looking at #236's training
+   log as a reference for convergence trajectory:
+
+  ┌───────┬─────────────────┬────────────────┐
+  │ Steps │ #236 train_loss │ Learning phase │
+  ├───────┼─────────────────┼────────────────┤
+  │ 1-10  │ 6.9-7.8         │ Random         │
+  ├───────┼─────────────────┼────────────────┤
+  │ 200   │ 2.77            │ Rapid descent  │
+  ├───────┼─────────────────┼────────────────┤
+  │ 1000  │ 2.32            │ Slowing        │
+  ├───────┼─────────────────┼────────────────┤
+  │ 5000  │ 1.96            │ Plateau        │
+  └───────┴─────────────────┴────────────────┘
+
+  Their batch is 64x larger, so each of their steps does ~64x more work. Our 1500 steps ≈
+  their ~23 steps in terms of tokens seen. That's still early, but the loss curve is
+  steepest in those early steps — most of the representation structure forms there.
+
+  The real reasoning: TC regularizer penalizes redundancy between hidden dimensions. At
+  step 200 with loss ~7.0, all dimensions are essentially random noise — there's no
+  redundancy to penalize. You need the model in a regime where layers have started forming
+  correlated representations before a decorrelation signal can help.
+
+  1500 isn't magic — more is always better. But it's the practical tradeoff between "model
+  has actually learned something" and "I don't want to wait an hour on my Mac." If you're
+  willing to wait longer, 3000-5000 steps would be even more informative.
+
+Phase 2b: run: RUN_ID=baseline_s1 SEED={CHANGE ME} ITERATIONS=1500 TRAIN_BATCH_TOKENS=8192 \
+    VAL_LOSS_EVERY=500 VAL_BATCH_SIZE=8192 TRAIN_SEQ_LEN=1024 \
+    WARMUP_STEPS=20 MAX_WALLCLOCK_SECONDS=0 WARMDOWN_ITERS=450 \
+    python3 train_gpt_mlx.py 3 times. 
+seed 1: 216
+final_int8_zlib_roundtrip val_loss:3.1870 val_bpb:1.8875 eval_time:1643374ms
+final_int8_zlib_roundtrip_exact val_loss:3.18695701 val_bpb:1.88749545
+seed 2: 455
+final_int8_zlib_roundtrip val_loss:3.2072 val_bpb:1.8995 eval_time:1642269ms
+final_int8_zlib_roundtrip_exact val_loss:3.20720630 val_bpb:1.89948822
+seed 3: 3308
+final_int8_zlib_roundtrip val_loss:3.1624 val_bpb:1.8729 eval_time:1633989ms
+final_int8_zlib_roundtrip_exact val_loss:3.16237835 val_bpb:1.87293859
+
 
  Phase 3: Add TC Regularizer
 
@@ -375,6 +494,109 @@ search to the last 6 years.
  3. Add GPT.loss_with_tc() method that computes L_CE + λ_tc * TC
  4. Add env vars: TC_LAMBDA (default 0.0 — off by default), TC_ENABLED (default 0)
  5. Run with TC_ENABLED=1 TC_LAMBDA=0.005 and compare vs Phase 2
+
+Implementation: Differentiable Redundancy Regularizer
+
+ Approach: Correlation Frobenius Proxy + stop_gradient DTC Scaling
+
+ Key insight: We split the computation into:
+ 1. Differentiable TC proxy — sum of squared off-diagonal correlations (gradient flows
+ through hidden states → covariance → correlation matrix)
+ 2. Non-differentiable DTC scale — computed via stop_gradient(eigvalsh) to determine what
+ fraction of TC is redundancy vs synergy, used as a scalar multiplier
+
+ def redundancy_regularizer(hidden_states: list[mx.array]) -> mx.array:
+     """Novel redundancy-only regularizer from FID theory.
+     Penalizes redundant correlations while preserving synergistic ones.
+
+     Differentiable path: correlation Frobenius norm (||R||²_F - d)
+     Non-diff scaling: (TC - DTC) / TC ratio via eigendecomposition
+     """
+     reg_total = mx.array(0.0, dtype=mx.float32)
+     for h in hidden_states:
+         h_flat = h.reshape(-1, h.shape[-1])  # [B*T, d]
+         h_c = h_flat - mx.mean(h_flat, axis=0, keepdims=True)
+         n = h_flat.shape[0]
+         cov = (h_c.T @ h_c) / n + 1e-6 * mx.eye(h_flat.shape[-1])
+
+         # --- Differentiable part: off-diagonal correlation energy ---
+         std = mx.sqrt(mx.diag(cov))
+         corr = cov / (std[:, None] * std[None, :] + 1e-8)
+         d = float(corr.shape[0])
+         # ||R||²_F - d = sum of squared off-diagonal correlations
+         # This is proportional to TC for near-Gaussian distributions
+         tc_proxy = 0.5 * (mx.sum(corr * corr) - d)
+
+         # --- Non-differentiable part: redundancy fraction ---
+         # Compute exact TC and DTC via eigenvalues (no gradient needed)
+         eigenvalues = mx.stop_gradient(
+             mx.linalg.eigvalsh(cov, stream=mx.cpu)
+         )
+         eigenvalues = mx.maximum(eigenvalues, mx.array(1e-10))
+         log_det = mx.sum(mx.log(eigenvalues))
+         log_diag = mx.sum(mx.log(mx.stop_gradient(mx.diag(cov))))
+
+         tc_exact = 0.5 * (log_diag - log_det)
+
+         # DTC needs diag(Σ⁻¹): compute from eigendecomposition
+         _, eigvecs = mx.linalg.eigh(mx.stop_gradient(cov), stream=mx.cpu)
+         inv_eig = 1.0 / eigenvalues
+         inv_diag = mx.sum(eigvecs * eigvecs * inv_eig[None, :], axis=1)
+         dtc_exact = 0.5 * (log_det + mx.sum(mx.log(inv_diag)))
+
+         # redundancy_fraction: what fraction of TC is pure redundancy
+         redundancy_frac = mx.stop_gradient(
+             mx.clip((tc_exact - dtc_exact) / (tc_exact + 1e-8), 0.0, 1.0)
+         )
+
+         # Scale the differentiable proxy by redundancy fraction
+         reg_total = reg_total + redundancy_frac * tc_proxy
+     return reg_total
+
+ Why This Works
+
+ - Gradient signal comes from the differentiable correlation proxy (pushes hidden dimensions
+  toward independence)
+ - Selectivity comes from the redundancy fraction: layers with high synergy (redundancy_frac
+  ≈ 0) get no penalty, layers with high redundancy (redundancy_frac ≈ 1) get full penalty
+ - Skip connections that create useful synergy are preserved because DTC captures their
+ contribution
+ - Cost: one matmul for covariance + one eigendecomposition (CPU, no grad) per layer per
+ step ≈ negligible
+
+
+
+Phase 3a (lambda 0.005):
+RUN_ID=redund_s1 SEED=216 ITERATIONS=1500 TRAIN_BATCH_TOKENS=8192 \
+   VAL_LOSS_EVERY=500 VAL_BATCH_SIZE=8192 TRAIN_SEQ_LEN=1024 \
+   WARMUP_STEPS=20 MAX_WALLCLOCK_SECONDS=0 WARMDOWN_ITERS=450 \
+   TC_ENABLED=1 TC_LAMBDA=0.005 \
+   python3 train_gpt_mlx.py
+
+
+Metrics to Compare
+
+ ┌────────────────┬─────────────────┬──────────────┬────────────────────┐
+ │     Metric     │ Baseline (mean) │ What we want │  Signal threshold  │
+ ├────────────────┼─────────────────┼──────────────┼────────────────────┤
+ │ Post-quant BPB │ 1.8866          │ < 1.87       │ > 1 std below mean │
+ ├────────────────┼─────────────────┼──────────────┼────────────────────┤
+ │ Quant gap      │ 0.0011          │ < 0.0008     │ Smaller gap        │
+ ├────────────────┼─────────────────┼──────────────┼────────────────────┤
+ │ Artifact size  │ 15,704,573      │ < 15,650,000 │ Any reduction      │
+ ├────────────────┼─────────────────┼──────────────┼────────────────────┤
+ │ Step time      │ ~1018ms         │ < 1070ms     │ < 5% overhead      │
+ └────────────────┴─────────────────┴──────────────┴────────────────────┘
+
+ Verification Steps
+
+ 1. Syntax check: python3 -c "import py_compile; py_compile.compile('train_gpt_mlx.py')"
+ 2. Smoke test: 2 iterations with TC_ENABLED=1 to verify no crashes
+ 3. Full run: seed 216, 1500 iterations, compare all 4 metrics
+ 4. If promising: run seeds 455 and 3308
+
+
+
 
  Phase 4: Synergy Audit + Quantization
 
@@ -427,4 +649,16 @@ search to the last 6 years.
 
  Total: ~140 new lines, well within 1500-line limit (current: 1097 lines)
 
- 
+From #236's train log:
+
+  train_batch_tokens:524288 train_seq_len:2048 iterations:20000 warmup_steps:20
+  max_wallclock_seconds:600.000
+
+  - VAL_BATCH_SIZE=524288 (their default)
+  - ITERATIONS=20000 (never reached — stopped at step 8936 due to 600s wallclock cap)
+  - VAL_LOSS_EVERY=1000 (validated at steps 0, 1000, 2000, 3000, ..., 8000, then final at 8936)
+
+  All of these already match our defaults. The only override you'd need for a local MLX run is reducing
+   batch/seq sizes for memory.
+
+

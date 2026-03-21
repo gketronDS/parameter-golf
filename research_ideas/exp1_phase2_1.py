@@ -347,45 +347,23 @@ class BigramHashEmbedding(nn.Module):
         return h * self.scale.astype(h.dtype)
 
 
-def redundancy_regularizer(hidden_states: list[mx.array]) -> mx.array:
-    """Redundancy-only regularizer from Partial Information Decomposition theory.
-    Penalizes redundant correlations (TC - DTC) while preserving synergistic ones.
-
-    Differentiable path: off-diagonal correlation Frobenius norm (proxy for TC).
-    Non-diff scaling: (TC - DTC) / TC ratio via eigendecomposition with stop_gradient."""
-    reg_total = mx.array(0.0, dtype=mx.float32)
+def tc_regularizer(hidden_states: list[mx.array]) -> mx.array:
+    """Total correlation regularizer — encourages non-redundant representations.
+    Computed as sum of TC across layers using Gaussian approximation via covariance."""
+    tc_total = mx.array(0.0, dtype=mx.float32)
     for h in hidden_states:
         h_flat = h.reshape(-1, h.shape[-1])  # [B*T, d]
-        h_c = h_flat - mx.mean(h_flat, axis=0, keepdims=True)
+        h_centered = h_flat - mx.mean(h_flat, axis=0, keepdims=True)
         n = h_flat.shape[0]
-        cov = (h_c.T @ h_c) / n + 1e-6 * mx.eye(h_flat.shape[-1])
-
-        # --- Differentiable part: off-diagonal correlation energy ---
-        std = mx.sqrt(mx.diag(cov))
-        corr = cov / (std[:, None] * std[None, :] + 1e-8)
-        d = float(corr.shape[0])
-        # ||R||^2_F - d = sum of squared off-diagonal correlations
-        tc_proxy = 0.5 * (mx.sum(corr * corr) - d)
-
-        # --- Non-differentiable part: redundancy fraction ---
-        cov_sg = mx.stop_gradient(cov)
-        eigenvalues, eigvecs = mx.linalg.eigh(cov_sg, stream=mx.cpu)
-        eigenvalues = mx.maximum(eigenvalues, mx.array(1e-10))
-        log_det = mx.sum(mx.log(eigenvalues))
-        log_diag = mx.sum(mx.log(mx.stop_gradient(mx.diag(cov))))
-        tc_exact = 0.5 * (log_diag - log_det)
-
-        # DTC needs diag(Sigma^{-1}): compute from eigendecomposition
-        inv_eig = 1.0 / eigenvalues
-        inv_diag = mx.sum(eigvecs * eigvecs * inv_eig[None, :], axis=1)
-        dtc_exact = 0.5 * (log_det + mx.sum(mx.log(inv_diag)))
-
-        # What fraction of TC is pure redundancy (vs synergy)
-        redundancy_frac = mx.stop_gradient(
-            mx.clip((tc_exact - dtc_exact) / (tc_exact + 1e-8), 0.0, 1.0)
-        )
-        reg_total = reg_total + redundancy_frac * tc_proxy
-    return reg_total
+        cov = (h_centered.T @ h_centered) / n
+        # Add small diagonal for numerical stability
+        cov = cov + 1e-6 * mx.eye(cov.shape[0])
+        L = mx.linalg.cholesky(cov)
+        log_det = 2.0 * mx.sum(mx.log(mx.abs(mx.diag(L)) + 1e-10))
+        var_sum = mx.sum(mx.log(mx.abs(mx.diag(cov)) + 1e-10))
+        tc = 0.5 * (var_sum - log_det)
+        tc_total = tc_total + tc
+    return tc_total
 
 
 class CausalSelfAttention(nn.Module):
@@ -542,13 +520,13 @@ class GPT(nn.Module):
         for i in range(self.num_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-            if hidden_states is not None and i > 0:
+            if hidden_states is not None:
                 hidden_states.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].astype(x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
-            if hidden_states is not None and i < self.num_decoder_layers - 1:
+            if hidden_states is not None:
                 hidden_states.append(x)
         out = self.final_norm(x)
         if return_hidden:
@@ -579,7 +557,7 @@ class GPT(nn.Module):
                 loss_sum = loss_sum + nn.losses.cross_entropy(logits.astype(mx.float32), y[s:e], reduction="sum")
             ce = loss_sum / float(n)
         if use_tc:
-            return ce + self.tc_lambda * redundancy_regularizer(hidden_states)
+            return ce + self.tc_lambda * tc_regularizer(hidden_states)
         return ce
 
 # ==============================================================================
@@ -1196,11 +1174,11 @@ def main() -> None:
         if args.swa_enabled and lr_mul < args.swa_start_frac and (step + 1) % args.swa_every == 0:
             flat_params = dict(tree_flatten(model.parameters()))
             if swa_state is None:
-                swa_state = {k: np.array(v.astype(mx.float32)) for k, v in flat_params.items()}
+                swa_state = {k: np.array(v) for k, v in flat_params.items()}
                 swa_count = 1
             else:
                 for k, v in flat_params.items():
-                    swa_state[k] += np.array(v.astype(mx.float32))
+                    swa_state[k] += np.array(v)
                 swa_count += 1
 
         step_ms = 1000.0 * (time.perf_counter() - step_t0)
@@ -1220,8 +1198,7 @@ def main() -> None:
     # ==============================================================================
     if args.swa_enabled and swa_state is not None and swa_count > 1:
         log(f"swa:averaging {swa_count} snapshots")
-        orig_dtypes = {k: v.dtype for k, v in tree_flatten(model.parameters())}
-        avg = {k: mx.array(v / swa_count).astype(orig_dtypes.get(k, mx.float32)) for k, v in swa_state.items()}
+        avg = {k: mx.array(v / swa_count) for k, v in swa_state.items()}
         model.update(tree_unflatten(list(avg.items())))
 
     # ==============================================================================
